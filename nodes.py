@@ -3,6 +3,9 @@ import random
 import torch
 import ffmpeg
 import hashlib
+import librosa
+import numpy as np
+import soundfile as sf
 import folder_paths
 from huggingface_hub import hf_hub_download
 from .uvr5.mdxnet import MDXNetDereverb
@@ -14,8 +17,39 @@ output_path = folder_paths.get_output_directory()
 base_path = os.path.dirname(input_path)
 node_path = os.path.join(base_path,"custom_nodes/ComfyUI-UVR5")
 weights_path = os.path.join(node_path, "uvr5")
-device= "cuda" if cuda_malloc_supported() else "cpu"
-is_half=True
+# cuda_malloc_supported() misreports True on Apple Silicon, so detect the real
+# backend with torch. Half precision is only safe on CUDA.
+if torch.cuda.is_available():
+    device = "cuda"
+    is_half = True
+elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    device = "mps"
+    is_half = False
+else:
+    device = "cpu"
+    is_half = False
+
+
+def audio_to_tempfile(audio):
+    """Write a ComfyUI standard AUDIO dict to a temp wav file and return its path."""
+    waveform = audio["waveform"]
+    sample_rate = int(audio["sample_rate"])
+    # waveform: [batch, channels, samples] -> first item as [samples, channels]
+    wav = waveform[0].cpu().numpy().T
+    os.makedirs(input_path, exist_ok=True)
+    tmp_path = os.path.join(input_path, "uvr5_input_%d.wav" % random.randint(0, 0xffffffff))
+    sf.write(tmp_path, wav, sample_rate)
+    return tmp_path
+
+
+def file_to_audio(path):
+    """Load an audio file into a ComfyUI standard AUDIO dict."""
+    wav, sr = librosa.load(path, sr=None, mono=False)
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim == 1:
+        wav = wav[np.newaxis, :]  # [channels, samples]
+    waveform = torch.from_numpy(wav).unsqueeze(0)  # [1, channels, samples]
+    return {"waveform": waveform, "sample_rate": int(sr)}
 
 
 class PreViewAudio:
@@ -131,7 +165,7 @@ class UVR5:
                       "VR-DeEchoAggressive.pth","VR-DeEchoDeReverb.pth","VR-DeEchoNormal.pth","onnx_dereverb_By_FoxJoy"]
         return {
             "required": {
-                "audio": ("AUDIOPATH",),
+                "audio": ("AUDIO",),
                 "model": (model_list,{
                     "default": "HP5-主旋律人声vocals+其他instrumentals.pth"
                 }),
@@ -148,7 +182,7 @@ class UVR5:
             },
         }
 
-    RETURN_TYPES = ("AUDIOPATH","AUDIOPATH")
+    RETURN_TYPES = ("AUDIO","AUDIO")
     RETURN_NAMES = ("vocal_AUDIO","bgm_AUDIO")
 
     FUNCTION = "split"
@@ -158,7 +192,9 @@ class UVR5:
     CATEGORY = "AIFSH_UVR5"
 
     def split(self, audio, model,agg,format0):
-        
+        # Accept ComfyUI standard AUDIO: write it to a temp file for the path-based backend.
+        audio = audio_to_tempfile(audio)
+
         if model == "onnx_dereverb_By_FoxJoy":
             if not os.path.isfile(os.path.join(weights_path,"uvr5_weights/onnx_dereverb_By_FoxJoy", "vocals.onnx")):
                 hf_hub_download(
@@ -177,10 +213,24 @@ class UVR5:
                 )
         save_root_vocal = output_path
         save_root_ins = output_path
-        vocal_AUDIO,bgm_AUDIO = self.uvr(model, audio, save_root_vocal,save_root_ins,agg, format0)
-        return (vocal_AUDIO,bgm_AUDIO,)
+        try:
+            vocal_path,bgm_path = self.uvr(model, audio, save_root_vocal,save_root_ins,agg, format0, device, is_half)
+        except Exception as e:
+            if device != "cpu":
+                print(f"[UVR5] inference on '{device}' failed ({e}); retrying on CPU")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                vocal_path,bgm_path = self.uvr(model, audio, save_root_vocal,save_root_ins,agg, format0, "cpu", False)
+            else:
+                raise
+        try:
+            os.remove(audio)
+        except:
+            pass
+        # Return ComfyUI standard AUDIO so it connects to SaveAudio/PreviewAudio directly.
+        return (file_to_audio(vocal_path), file_to_audio(bgm_path),)
 
-    def uvr(self, model_name, inp_root, save_root_vocal,save_root_ins, agg, format0):
+    def uvr(self, model_name, inp_root, save_root_vocal,save_root_ins, agg, format0, device=device, is_half=is_half):
         vocal_AUDIO,bgm_AUDIO = "", ""
         inp_root = inp_root.strip(" ").strip('"').strip("\n").strip('"').strip(" ")
         save_root_vocal = (
